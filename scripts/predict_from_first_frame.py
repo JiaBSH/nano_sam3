@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import re
@@ -37,13 +38,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-root",
         type=Path,
-        default=Path("data_cus/gas-liquid-split-by-mark_x2"),
+        default=Path("data_cus/zwl_resize512_878"),
         help="Dataset root containing group_*/frame and group_*/mark folders.",
     )
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=Path("outputs/gas-liquid-first-frame-sam3"),
+        default=Path("outputs/zwl_resize512_878-sam3"),
         help="Directory used to store predicted annotations.",
     )
     parser.add_argument(
@@ -95,6 +96,16 @@ def parse_args() -> argparse.Namespace:
         "--offload-state-to-cpu",
         action="store_true",
         help="Offload tracker state to CPU memory.",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=16,
+        help=(
+            "Maximum number of frames tracked per batch. Consecutive batches overlap by one "
+            "frame so the last prediction from the previous batch seeds the next batch. "
+            "Use 0 or a negative value to process the whole group at once."
+        ),
     )
     return parser.parse_args()
 
@@ -243,6 +254,64 @@ def create_sequential_jpeg_frames(frame_paths: list[Path], temp_root: Path) -> P
     return temp_frame_dir
 
 
+def build_chunk_ranges(num_frames: int, chunk_size: int) -> list[tuple[int, int]]:
+    if num_frames <= 0:
+        return []
+    if chunk_size <= 0 or chunk_size >= num_frames:
+        return [(0, num_frames)]
+    if chunk_size < 2 and num_frames > 1:
+        raise ValueError("chunk_size must be at least 2 when tracking multiple frames")
+
+    chunk_ranges: list[tuple[int, int]] = []
+    start = 0
+    while start < num_frames:
+        end = min(start + chunk_size, num_frames)
+        chunk_ranges.append((start, end))
+        if end >= num_frames:
+            break
+        start = end - 1
+    return chunk_ranges
+
+
+def release_inference_state(inference_state: Any) -> None:
+    del inference_state
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def export_frame_prediction(
+    frame_path: Path,
+    output_mark_dir: Path,
+    output_mask_dir: Path,
+    category_name: str,
+    instance_category_map: dict[int, str],
+    per_frame_masks: OrderedDict[int, np.ndarray],
+    instance_scores: dict[int, float],
+    min_area: float,
+    score_threshold: float,
+    save_mask_png: bool,
+) -> None:
+    output_json_path = output_mark_dir / f"{frame_path.stem}.json"
+    save_masks_as_isat(
+        image_path=frame_path,
+        instance_masks=list(per_frame_masks.values()),
+        output_json_path=output_json_path,
+        category_name=category_name,
+        scores=[instance_scores[int(instance_id)] for instance_id in per_frame_masks],
+        instance_ids=[int(instance_id) for instance_id in per_frame_masks],
+        instance_categories=[
+            instance_category_map.get(int(instance_id), category_name)
+            for instance_id in per_frame_masks
+        ],
+        min_area=min_area,
+        score_threshold=score_threshold,
+    )
+
+    if save_mask_png:
+        write_instance_mask_png(output_mask_dir / f"{frame_path.stem}.png", per_frame_masks)
+
+
 def write_instance_mask_png(path: Path, instance_masks: OrderedDict[int, np.ndarray]) -> None:
     sample_mask = next(iter(instance_masks.values()))
     colored = np.zeros((*sample_mask.shape, 3), dtype=np.uint8)
@@ -270,6 +339,7 @@ def propagate_group(
     save_mask_png: bool,
     offload_video_to_cpu: bool,
     offload_state_to_cpu: bool,
+    chunk_size: int,
 ) -> None:
     frame_dir = group_dir / "frame"
     mark_dir = group_dir / "mark"
@@ -300,66 +370,82 @@ def propagate_group(
     if save_mask_png:
         write_instance_mask_png(output_mask_dir / f"{first_frame_path.stem}.png", first_frame_masks)
 
-    with tempfile.TemporaryDirectory(prefix=f"sam3_{group_dir.name}_") as temp_dir_str:
-        temp_dir = Path(temp_dir_str)
-        jpeg_frame_dir = create_sequential_jpeg_frames(frame_paths, temp_dir)
-        inference_state = predictor.init_state(
-            video_path=str(jpeg_frame_dir),
-            offload_video_to_cpu=offload_video_to_cpu,
-            offload_state_to_cpu=offload_state_to_cpu,
+    if len(frame_paths) <= 1:
+        return
+
+    carry_masks = first_frame_masks
+    chunk_ranges = build_chunk_ranges(len(frame_paths), chunk_size)
+
+    for chunk_idx, (start_idx, end_idx) in enumerate(chunk_ranges, start=1):
+        chunk_frame_paths = frame_paths[start_idx:end_idx]
+        if len(chunk_frame_paths) < 2:
+            continue
+
+        print(
+            f"[SAM3]   chunk {chunk_idx}/{len(chunk_ranges)}: "
+            f"frames {start_idx}-{end_idx - 1}"
         )
 
-        for instance_id, mask in first_frame_masks.items():
-            predictor.add_new_mask(
-                inference_state=inference_state,
-                frame_idx=0,
-                obj_id=int(instance_id),
-                mask=torch.from_numpy(mask),
+        with tempfile.TemporaryDirectory(prefix=f"sam3_{group_dir.name}_{chunk_idx:03d}_") as temp_dir_str:
+            temp_dir = Path(temp_dir_str)
+            jpeg_frame_dir = create_sequential_jpeg_frames(chunk_frame_paths, temp_dir)
+            inference_state = predictor.init_state(
+                video_path=str(jpeg_frame_dir),
+                offload_video_to_cpu=offload_video_to_cpu,
+                offload_state_to_cpu=offload_state_to_cpu,
             )
 
-        if len(frame_paths) <= 1:
-            return
+            try:
+                for instance_id, mask in carry_masks.items():
+                    predictor.add_new_mask(
+                        inference_state=inference_state,
+                        frame_idx=0,
+                        obj_id=int(instance_id),
+                        mask=torch.from_numpy(mask),
+                    )
 
-        for frame_idx, obj_ids, _, video_res_masks, obj_scores in predictor.propagate_in_video(
-            inference_state,
-            start_frame_idx=1,
-            max_frame_num_to_track=len(frame_paths) - 1,
-            reverse=False,
-            propagate_preflight=True,
-        ):
-            per_frame_masks: OrderedDict[int, np.ndarray] = OrderedDict()
-            for obj_pos, obj_id in enumerate(obj_ids):
-                mask_tensor = video_res_masks[obj_pos]
-                mask_2d = (mask_tensor > 0.0).detach().cpu().numpy().squeeze().astype(bool)
-                per_frame_masks[int(obj_id)] = mask_2d
+                next_carry_masks: OrderedDict[int, np.ndarray] | None = None
+                for local_frame_idx, obj_ids, _, video_res_masks, obj_scores in predictor.propagate_in_video(
+                    inference_state,
+                    start_frame_idx=1,
+                    max_frame_num_to_track=len(chunk_frame_paths) - 1,
+                    reverse=False,
+                    propagate_preflight=True,
+                ):
+                    per_frame_masks: OrderedDict[int, np.ndarray] = OrderedDict()
+                    for obj_pos, obj_id in enumerate(obj_ids):
+                        mask_tensor = video_res_masks[obj_pos]
+                        mask_2d = (mask_tensor > 0.0).detach().cpu().numpy().squeeze().astype(bool)
+                        per_frame_masks[int(obj_id)] = mask_2d
 
-            if obj_scores is None:
-                instance_scores = {int(obj_id): 1.0 for obj_id in obj_ids}
-            else:
-                probs = torch.sigmoid(obj_scores.detach().to(torch.float32)).cpu().numpy().reshape(-1)
-                instance_scores = {
-                    int(obj_id): float(probs[obj_pos]) for obj_pos, obj_id in enumerate(obj_ids)
-                }
+                    if obj_scores is None:
+                        instance_scores = {int(obj_id): 1.0 for obj_id in obj_ids}
+                    else:
+                        probs = torch.sigmoid(obj_scores.detach().to(torch.float32)).cpu().numpy().reshape(-1)
+                        instance_scores = {
+                            int(obj_id): float(probs[obj_pos])
+                            for obj_pos, obj_id in enumerate(obj_ids)
+                        }
 
-            frame_path = frame_paths[frame_idx]
-            output_json_path = output_mark_dir / f"{frame_path.stem}.json"
-            save_masks_as_isat(
-                image_path=frame_path,
-                instance_masks=list(per_frame_masks.values()),
-                output_json_path=output_json_path,
-                category_name=category_name,
-                scores=[instance_scores[int(instance_id)] for instance_id in per_frame_masks],
-                instance_ids=[int(instance_id) for instance_id in per_frame_masks],
-                instance_categories=[
-                    instance_category_map.get(int(instance_id), category_name)
-                    for instance_id in per_frame_masks
-                ],
-                min_area=min_area,
-                score_threshold=score_threshold,
-            )
+                    global_frame_idx = start_idx + local_frame_idx
+                    export_frame_prediction(
+                        frame_path=frame_paths[global_frame_idx],
+                        output_mark_dir=output_mark_dir,
+                        output_mask_dir=output_mask_dir,
+                        category_name=category_name,
+                        instance_category_map=instance_category_map,
+                        per_frame_masks=per_frame_masks,
+                        instance_scores=instance_scores,
+                        min_area=min_area,
+                        score_threshold=score_threshold,
+                        save_mask_png=save_mask_png,
+                    )
+                    next_carry_masks = per_frame_masks
 
-            if save_mask_png:
-                write_instance_mask_png(output_mask_dir / f"{frame_path.stem}.png", per_frame_masks)
+                if next_carry_masks is not None:
+                    carry_masks = next_carry_masks
+            finally:
+                release_inference_state(inference_state)
 
 
 def main() -> None:
@@ -399,6 +485,7 @@ def main() -> None:
             save_mask_png=bool(args.save_mask_png),
             offload_video_to_cpu=bool(args.offload_video_to_cpu),
             offload_state_to_cpu=bool(args.offload_state_to_cpu),
+            chunk_size=int(args.chunk_size),
         )
 
     print(f"[SAM3] Finished. Outputs saved to {output_root}")

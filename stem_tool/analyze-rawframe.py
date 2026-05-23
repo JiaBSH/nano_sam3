@@ -2668,15 +2668,15 @@ class GasTracker:
 # 主程序入口
 # ======================
 if __name__ == "__main__":
-    gas_category = "nanodroplet"
-    output_root = os.path.join("outputs", gas_category)
-    raw_frame_dir = "data_cus/gas-liquid-frame"
+    gas_category = "nanocluster"
+    output_root = os.path.join("outputs/zwl", gas_category)
+    raw_frame_dir = "data_cus/zwl_resize512_878/group_0/frame"
     manual_scale_pixel_length =10   # e.g. 120.0 means the 20 nm scale bar spans 120 px
     manual_nm_per_px = None            # e.g. 0.166667; overrides manual_scale_pixel_length if set alone
     min_track_length_plot = 3          # filter short-lived detections in trajectory plots
 
     tracker = GasTracker(
-        json_dir="outputs/gas-liquid-first-frame-sam3/mask_source",
+        json_dir="outputs/zwl_resize512_878-sam3/group_0/mark",
         raw_frame_dir=raw_frame_dir,
         #scale_csv=r"D:\code\nanojccode\data\nanoframes\scalebar_mauel.csv",
         output_root=output_root,
