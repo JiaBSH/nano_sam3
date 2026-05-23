@@ -1,6 +1,7 @@
 import os
 import json
 import csv
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -15,25 +16,45 @@ class GasTracker:
         self,
         json_dir,
         image_path=None,
+        raw_frame_dir=None,
         scale_csv=None,
         scale_value_nm=20.0,
+        manual_scale_pixel_length=None,
+        manual_nm_per_px=None,
         strict_scale_match=False,
+        output_root=None,
         gas_category="gas",
         pin_category="pin"
     ):
         self.json_dir = json_dir
         self.image_path = image_path
-        self.image_dir = os.path.dirname(image_path) if image_path else None
+        self.raw_frame_dir = str(raw_frame_dir) if raw_frame_dir else None
+        self.image_dir = self.raw_frame_dir or (os.path.dirname(image_path) if image_path else None)
         self.scale_csv = scale_csv
         self.scale_value_nm = float(scale_value_nm)
+        self.manual_scale_pixel_length = (
+            None if manual_scale_pixel_length in (None, "") else float(manual_scale_pixel_length)
+        )
+        self.manual_nm_per_px = None if manual_nm_per_px in (None, "") else float(manual_nm_per_px)
         self.strict_scale_match = bool(strict_scale_match)
-        self.gas_category = gas_category
+        self.gas_category = str(gas_category).strip() or "gas"
         self.pin_category = pin_category
-        
-        # Create output root directory named as gas_category
-        self.output_root = self.gas_category
-        if not os.path.exists(self.output_root):
-            os.makedirs(self.output_root)
+
+        if self.manual_nm_per_px is not None and self.manual_nm_per_px <= 0:
+            raise ValueError(f"manual_nm_per_px must be > 0, got {self.manual_nm_per_px}")
+        if self.manual_scale_pixel_length is not None and self.manual_scale_pixel_length <= 0:
+            raise ValueError(
+                f"manual_scale_pixel_length must be > 0, got {self.manual_scale_pixel_length}"
+            )
+        if self.manual_nm_per_px is not None and self.manual_scale_pixel_length is not None:
+            raise ValueError(
+                "Specify either manual_nm_per_px or manual_scale_pixel_length, not both."
+            )
+        if self.manual_nm_per_px is None and self.manual_scale_pixel_length is not None:
+            self.manual_nm_per_px = self.scale_value_nm / self.manual_scale_pixel_length
+
+        self.output_root = self._resolve_output_root(output_root)
+        os.makedirs(self.output_root, exist_ok=True)
 
         self.json_files = self._load_and_sort_jsons()
 
@@ -65,14 +86,103 @@ class GasTracker:
         self.ref_pin_centroid = None
         self.last_shift = np.zeros(2)
 
-        # 画图准备（image_path 可选；未设置时跳过依赖底图尺寸的绘图）
+        # 画图准备（优先使用 raw_frame_dir；image_path 仅作兼容兜底）
         self.W, self.H = None, None
         if self.image_path:
             img = Image.open(self.image_path)
             self.W, self.H = img.size
+        elif self.image_dir:
+            self.W, self.H = self._infer_frame_size(self.image_dir)
 
         # Make sure Chinese text can render on Windows (avoid "□□□" tofu boxes)
         self._configure_matplotlib_fonts()
+
+    def _resolve_output_root(self, output_root):
+        if output_root is None:
+            return self.gas_category
+        return str(output_root)
+
+    def _ensure_output_root(self):
+        os.makedirs(self.output_root, exist_ok=True)
+
+    def _resolve_output_dir(self, output_dir, default_dir_name):
+        if output_dir is None:
+            return os.path.join(self.output_root, default_dir_name)
+        if os.path.isabs(output_dir):
+            return output_dir
+        return os.path.join(self.output_root, output_dir)
+
+    def _uses_pixel_units(self):
+        return self.scale_csv is None and self.manual_nm_per_px is None
+
+    def _length_unit(self):
+        return "px" if self._uses_pixel_units() else "nm"
+
+    def _area_unit(self):
+        return f"{self._length_unit()}^2"
+
+    def _speed_unit(self):
+        return f"{self._length_unit()}/s"
+
+    def _scale_column_name(self):
+        return f"{self._length_unit()}_per_pixel"
+
+    def _coord_column_name(self, axis_name):
+        return f"{axis_name}_{self._length_unit()}"
+
+    def _area_column_name(self, prefix="area"):
+        return f"{prefix}_{self._length_unit()}2"
+
+    def _distance_column_name(self, prefix):
+        return f"{prefix}_{self._length_unit()}"
+
+    def _contour_column_name(self):
+        return f"contour_points_{self._length_unit()}"
+
+    def _max_dist_label(self):
+        return f"max_dist_{self._length_unit()}"
+
+    def _infer_frame_size(self, image_dir):
+        if not image_dir or not os.path.isdir(image_dir):
+            return None, None
+
+        possible_exts = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+        for frame_name in [Path(json_name).stem for json_name in self.json_files]:
+            for ext in possible_exts:
+                img_path = os.path.join(image_dir, frame_name + ext)
+                if not os.path.exists(img_path):
+                    continue
+                try:
+                    with Image.open(img_path) as img:
+                        return img.size
+                except Exception:
+                    continue
+        return None, None
+
+    def _coords_nm_to_plot_px(self, coords_nm, frame_name=None, nm_per_px=None):
+        coords_arr = np.asarray(coords_nm, dtype=np.float64)
+        scale = nm_per_px
+        if scale is None and frame_name is not None:
+            try:
+                scale = self._nm_per_px_for_frame(frame_name)
+            except Exception:
+                scale = None
+        if scale is None:
+            return coords_arr
+        scale = float(scale)
+        if abs(scale) <= 1e-12:
+            return coords_arr
+        return coords_arr / scale
+
+    def _object_detections_by_frame(self):
+        from collections import defaultdict
+
+        by_frame = defaultdict(list)
+        for frame_id, frame_name, nm_per_px, cx_nm, cy_nm, area_nm2 in self.object_records:
+            by_frame[int(frame_id)].append(
+                (frame_name, float(nm_per_px), float(cx_nm), float(cy_nm), float(area_nm2))
+            )
+        return by_frame
 
     @staticmethod
     def _configure_matplotlib_fonts():
@@ -177,11 +287,13 @@ class GasTracker:
 
     def _nm_per_px_for_frame(self, frame_name):
         if self.scale_csv is None:
-            # No scale CSV: keep pipeline running in pixel-space (1 px = 1 pseudo-nm unit).
+            if self.manual_nm_per_px is not None:
+                return float(self.manual_nm_per_px)
+            # No scale CSV: keep pipeline running in pixel-space (1 px = 1 px).
             if not self._warned_no_scale_csv:
                 print(
-                    "[warn] scale_csv is not set. Continue with fallback nm_per_px=1.0 "
-                    "(numerical values are pixel-scale, not real nm)."
+                    "[warn] scale_csv is not set. Continue with fallback px_per_pixel=1.0 "
+                    "(all exported values and plots will use pixel units)."
                 )
                 self._warned_no_scale_csv = True
             return 1.0
@@ -202,7 +314,7 @@ class GasTracker:
         if not self._warned_missing_scale_match:
             print(
                 "[warn] No matching scale and no fallback available. "
-                "Use nm_per_px=1.0 (pixel-scale units)."
+                "Use px_per_pixel=1.0 (pixel-scale units)."
             )
             self._warned_missing_scale_match = True
         return 1.0
@@ -694,17 +806,26 @@ class GasTracker:
         return export_ids
 
     def export_results(self, max_dist=50.0, id_mode="event", use_display_id=True):
+        self._ensure_output_root()
         export_ids = self._build_export_instance_ids(
             max_dist=max_dist,
             id_mode=id_mode,
             use_display_id=use_display_id,
         )
 
+        scale_col = self._scale_column_name()
+        area_col = self._area_column_name()
+        contour_col = self._contour_column_name()
+        cx_col = self._coord_column_name("cx")
+        cy_col = self._coord_column_name("cy")
+        diameter_col = self._distance_column_name("diameter")
+        height_col = self._distance_column_name("height")
+
         # 面积
         path1 = os.path.join(self.output_root, f"{self.gas_category}_area_vs_frame.csv")
         with open(path1, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["instance_id", "frame_id", "frame_name", "nm_per_pixel", "area_nm2"])
+            writer.writerow(["instance_id", "frame_id", "frame_name", scale_col, area_col])
             writer.writerows(
                 [[int(instance_id), frame_id, frame_name, f"{nm_per_px:.6f}", f"{area_nm2:.6f}"]
                  for instance_id, (frame_id, frame_name, nm_per_px, area_nm2) in zip(export_ids, self.area_records)]
@@ -714,7 +835,7 @@ class GasTracker:
         path2 = os.path.join(self.output_root, f"{self.gas_category}_contours_by_frame.csv")
         with open(path2, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["instance_id", "frame_id", "frame_name", "contour_points_nm"])
+            writer.writerow(["instance_id", "frame_id", "frame_name", contour_col])
             writer.writerows(
                 [[int(instance_id)] + row for instance_id, row in zip(export_ids, self.contour_records)]
             )
@@ -723,7 +844,7 @@ class GasTracker:
         path3 = os.path.join(self.output_root, f"{self.gas_category}_centroids.csv")
         with open(path3, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["instance_id", "frame_id", "frame_name", "nm_per_pixel", "cx_nm", "cy_nm"])
+            writer.writerow(["instance_id", "frame_id", "frame_name", scale_col, cx_col, cy_col])
             writer.writerows(
                 [[int(instance_id), frame_id, frame_name, f"{nm_per_px:.6f}", f"{cx_nm:.6f}", f"{cy_nm:.6f}"]
                  for instance_id, (frame_id, frame_name, nm_per_px, cx_nm, cy_nm) in zip(export_ids, self.centroid_records)]
@@ -733,7 +854,7 @@ class GasTracker:
         path4 = os.path.join(self.output_root, f"{self.gas_category}_diameter_height_vs_frame.csv")
         with open(path4, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["instance_id", "frame_id", "frame_name", "nm_per_pixel", "cx_nm", "cy_nm", "diameter_nm", "height_nm"])
+            writer.writerow(["instance_id", "frame_id", "frame_name", scale_col, cx_col, cy_col, diameter_col, height_col])
             for instance_id, row in zip(export_ids, self.diameter_height_records):
                 # row structure: [frame_id, frame_name, nm_per_px, cx_nm, cy_nm, d_nm, h_nm, min_x, min_y, max_x, max_y]
                 # we only export the first 7 fields here
@@ -754,20 +875,13 @@ class GasTracker:
         min_track_length=0,
         use_display_id=True,
     ):
-        if output_dir is None:
-             output_dir = os.path.join(self.output_root, "annotated_images")
-        else:
-             # If user supplied output_dir is absolute, use it. Else join with output_root?
-             # Let's assume user supplied just a name like "annotated_nanodroplet" and we want it inside output_root
-             # Check if it looks like an absolute path
-             if not os.path.isabs(output_dir):
-                 output_dir = os.path.join(self.output_root, output_dir)
+        output_dir = self._resolve_output_dir(output_dir, "annotated_images")
                  
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
-        if not self.image_path or not self.image_dir:
-            print("[skip] annotate_images: image_path is not set.")
+        if not self.image_dir:
+            print("[skip] annotate_images: no image directory is available. Set raw_frame_dir or image_path.")
             return
         
         print(f"Annotating images to {output_dir}...")
@@ -809,7 +923,7 @@ class GasTracker:
                     display_id_of = None
 
                 print(
-                    f"Annotate IDs enabled: mode={mode}, max_dist_nm={float(max_dist)}, "
+                    f"Annotate IDs enabled: mode={mode}, {self._max_dist_label()}={float(max_dist)}, "
                     f"min_track_length={int(min_track_length)}, use_display_id={bool(use_display_id)}, "
                     f"ids_total={len(series_by_id)}"
                 )
@@ -900,7 +1014,7 @@ class GasTracker:
                                     rect_poly = [tuple(map(float, p)) for p in corners_arr]
                                     draw.polygon(rect_poly, outline="cyan", width=2)
 
-                                    text = f"D:{d_nm:.1f}\nH:{h_nm:.1f}"
+                                    text = f"D:{d_nm:.1f} {self._length_unit()}\nH:{h_nm:.1f} {self._length_unit()}"
                                     cx = float(corners_arr[:, 0].mean())
                                     cy = float(corners_arr[:, 1].mean())
                                     draw.text((cx, cy), text, fill="yellow", font=font)
@@ -956,10 +1070,7 @@ class GasTracker:
             use_display_id: Remap internal IDs to compact 1-based display IDs.
             mask_alpha: Alpha value (0-255) for filled mask overlays.
         """
-        if output_dir is None:
-            output_dir = os.path.join(self.output_root, "annotated_rawframe")
-        elif not os.path.isabs(output_dir):
-            output_dir = os.path.join(self.output_root, output_dir)
+        output_dir = self._resolve_output_dir(output_dir, "annotated_rawframe")
 
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
@@ -1014,7 +1125,7 @@ class GasTracker:
                     display_id_of = None
 
                 print(
-                    f"Annotate IDs enabled: mode={mode}, max_dist_nm={float(max_dist)}, "
+                    f"Annotate IDs enabled: mode={mode}, {self._max_dist_label()}={float(max_dist)}, "
                     f"min_track_length={int(min_track_length)}, use_display_id={bool(use_display_id)}, "
                     f"ids_total={len(series_by_id)}"
                 )
@@ -1154,7 +1265,7 @@ class GasTracker:
                                     corners_arr = np.array(corners, dtype=np.float32)
                                     rect_poly = [tuple(map(float, p)) for p in corners_arr]
                                     draw.polygon(rect_poly, outline="cyan", width=2)
-                                    text = f"D:{d_nm:.1f}\nH:{h_nm:.1f}"
+                                    text = f"D:{d_nm:.1f} {self._length_unit()}\nH:{h_nm:.1f} {self._length_unit()}"
                                     cx = float(corners_arr[:, 0].mean())
                                     cy = float(corners_arr[:, 1].mean())
                                     draw.text((cx, cy), text, fill="yellow", font=font)
@@ -1222,10 +1333,7 @@ class GasTracker:
             max_dist: Maximum centroid linking distance (nm) for ID tracking.
             use_display_id: Remap internal IDs to compact 1-based display IDs.
         """
-        if output_dir is None:
-            output_dir = os.path.join(self.output_root, "annotated_allcat_rawframe")
-        elif not os.path.isabs(output_dir):
-            output_dir = os.path.join(self.output_root, output_dir)
+        output_dir = self._resolve_output_dir(output_dir, "annotated_allcat_rawframe")
 
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
@@ -1428,7 +1536,7 @@ class GasTracker:
                                     corners_arr = np.array(corners, dtype=np.float32)
                                     rect_poly = [tuple(map(float, pt)) for pt in corners_arr]
                                     draw.polygon(rect_poly, outline="cyan", width=2)
-                                    text = f"D:{d_nm:.1f}\nH:{h_nm:.1f}"
+                                    text = f"D:{d_nm:.1f} {self._length_unit()}\nH:{h_nm:.1f} {self._length_unit()}"
                                     cx = float(corners_arr[:, 0].mean())
                                     cy = float(corners_arr[:, 1].mean())
                                     draw.text((cx, cy), text, fill="yellow", font=font)
@@ -1466,6 +1574,7 @@ class GasTracker:
 
         CSV columns: track_id, frame_id, frame_name, nm_per_pixel, area_nm2, cx_nm, cy_nm
         """
+        self._ensure_output_root()
         if out_csv is None:
             out_csv = os.path.join(self.output_root, f"{self.gas_category}_tracked_area_vs_frame.csv")
         elif not os.path.isabs(out_csv):
@@ -1481,7 +1590,7 @@ class GasTracker:
         rows.sort(key=lambda r: (r[0], r[1]))
         with open(out_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["track_id", "frame_id", "frame_name", "nm_per_pixel", "area_nm2", "cx_nm", "cy_nm"])
+            writer.writerow(["track_id", "frame_id", "frame_name", self._scale_column_name(), self._area_column_name(), self._coord_column_name("cx"), self._coord_column_name("cy")])
             writer.writerows(rows)
 
         print(f" - {out_csv}")
@@ -1491,6 +1600,7 @@ class GasTracker:
 
         CSV columns: instance_id, frame_id, frame_name, nm_per_pixel, area_nm2, cx_nm, cy_nm
         """
+        self._ensure_output_root()
         if out_csv is None:
             out_csv = os.path.join(self.output_root, f"{self.gas_category}_instance_area_vs_frame.csv")
         elif not os.path.isabs(out_csv):
@@ -1514,7 +1624,7 @@ class GasTracker:
         rows.sort(key=lambda r: (r[0], r[1]))
         with open(out_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["instance_id", "frame_id", "frame_name", "nm_per_pixel", "area_nm2", "cx_nm", "cy_nm"])
+            writer.writerow(["instance_id", "frame_id", "frame_name", self._scale_column_name(), self._area_column_name(), self._coord_column_name("cx"), self._coord_column_name("cy")])
             writer.writerows(rows)
 
         print(f" - {out_csv}")
@@ -1527,6 +1637,7 @@ class GasTracker:
 
         CSV columns: instance_id, frame_id, frame_name, speed_nm_per_s
         """
+        self._ensure_output_root()
         if out_csv is None:
             out_csv = os.path.join(self.output_root, f"{self.gas_category}_instance_speed_vs_frame.csv")
         elif not os.path.isabs(out_csv):
@@ -1540,7 +1651,7 @@ class GasTracker:
         rows.sort(key=lambda r: (r[0], r[1]))
         with open(out_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["instance_id", "frame_id", "frame_name", "speed_nm_per_s"])
+            writer.writerow(["instance_id", "frame_id", "frame_name", f"speed_{self._length_unit()}_per_s"])
             writer.writerows(rows)
 
         print(f" - {out_csv}")
@@ -1775,6 +1886,7 @@ class GasTracker:
         Tracks are built by greedy centroid linking.
         NOTE: max_dist is in nm because centroids are stored in nm.
         """
+        self._ensure_output_root()
         if len(self.object_records) == 0:
             print("No object records to plot area trajectories.")
             return
@@ -1790,7 +1902,7 @@ class GasTracker:
             n_dets = sum(len(v) for v in by_frame.values())
             print(
                 f"[debug] {self.gas_category} area: frames_with_detections={n_frames}, total_detections={n_dets}, "
-                f"id_mode={id_mode}, max_dist_nm={float(max_dist)}, min_track_length={int(min_track_length)}"
+                f"id_mode={id_mode}, {self._max_dist_label()}={float(max_dist)}, min_track_length={int(min_track_length)}"
             )
 
         if str(id_mode).lower() == "greedy":
@@ -1818,7 +1930,7 @@ class GasTracker:
 
         fig, ax = plt.subplots(figsize=(12, 6))
         ax.set_xlabel("Frame id")
-        ax.set_ylabel("Area (nm^2)")
+        ax.set_ylabel(f"Area ({self._area_unit()})")
         ax.grid(True, alpha=0.25)
 
         # color cycle (good for dozens of tracks; for hundreds, they'll repeat)
@@ -1970,6 +2082,7 @@ class GasTracker:
         Speed is computed from centroid displacement between consecutive detections.
         NOTE: speed unit is nm/s; set frame_interval_s (seconds per frame) to match your acquisition.
         """
+        self._ensure_output_root()
         if len(self.object_records) == 0:
             print("No object records to plot velocity trajectories.")
             return
@@ -1985,7 +2098,7 @@ class GasTracker:
             n_dets = sum(len(v) for v in by_frame.values())
             print(
                 f"[debug] {self.gas_category} speed: frames_with_detections={n_frames}, total_detections={n_dets}, "
-                f"id_mode={id_mode}, max_dist_nm={float(max_dist)}, min_track_length={int(min_track_length)}, "
+                f"id_mode={id_mode}, {self._max_dist_label()}={float(max_dist)}, min_track_length={int(min_track_length)}, "
                 f"frame_interval_s={float(frame_interval_s)}, bin_size_frames={int(bin_size_frames)}"
             )
 
@@ -2055,7 +2168,7 @@ class GasTracker:
 
         fig, ax = plt.subplots(figsize=(12, 6))
         ax.set_xlabel("Frame id")
-        ax.set_ylabel("Speed (nm/s)")
+        ax.set_ylabel(f"Speed ({self._speed_unit()})")
         ax.grid(True, alpha=0.25)
 
         cmap = plt.cm.tab20
@@ -2197,6 +2310,7 @@ class GasTracker:
             per_frame: If True, normalize by delta_frame (handles skipped frames).
             reducer: How to aggregate multiple objects in the same frame: 'sum' or 'mean'.
         """
+        self._ensure_output_root()
         if len(self.area_records) == 0:
             print("No area records to plot area delta.")
             return
@@ -2267,9 +2381,9 @@ class GasTracker:
 
         fig, ax = plt.subplots(figsize=(12, 5))
         ax.plot(frames, deltas, color="#1f77b4", linewidth=1.6)
-        ax.axhline(0.0, color="black", linewidth=1.0, alpha=0.6)
+        ax.set_ylabel(f"Speed ({self._speed_unit()})")
         ax.set_xlabel("Frame id")
-        ylab = "ΔArea (nm^2/frame)" if bool(per_frame) else "ΔArea (nm^2)"
+        ylab = f"ΔArea ({self._area_unit()}/frame)" if bool(per_frame) else f"ΔArea ({self._area_unit()})"
         ax.set_ylabel(ylab)
         ax.grid(True, alpha=0.25)
 
@@ -2283,7 +2397,7 @@ class GasTracker:
         # export delta CSV
         with open(out_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["frame_id", "frame_name", "delta_area_nm2_per_frame" if bool(per_frame) else "delta_area_nm2"])
+            writer.writerow(["frame_id", "frame_name", f"{self._area_column_name('delta_area')}_per_frame" if bool(per_frame) else self._area_column_name("delta_area")])
             for fid, fname, da in delta_points:
                 writer.writerow([int(fid), str(fname), f"{float(da):.6f}"])
         print(f" - {out_csv}")
@@ -2295,6 +2409,7 @@ class GasTracker:
         - instance_count(frame): number of instances in this frame
         - total_area_nm2(frame): sum of all instance areas in this frame
         """
+        self._ensure_output_root()
         if len(self.area_records) == 0:
             print("No area records to plot frame totals.")
             return
@@ -2355,7 +2470,7 @@ class GasTracker:
         fig, ax = plt.subplots(figsize=(12, 5))
         ax.plot(frames, areas, color="#d62728", linewidth=1.8)
         ax.set_xlabel("Frame id")
-        ax.set_ylabel("Total area (nm^2)")
+        ax.set_ylabel(f"Total area ({self._area_unit()})")
         ax.grid(True, alpha=0.25)
         ax.set_title(f"{self.gas_category}: per-frame total area", loc="center")
         plt.tight_layout()
@@ -2365,7 +2480,7 @@ class GasTracker:
 
         with open(out_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["frame_id", "frame_name", "instance_count", "total_area_nm2"])
+            writer.writerow(["frame_id", "frame_name", "instance_count", self._area_column_name("total_area")])
             for fid in frame_ids:
                 writer.writerow([
                     int(fid),
@@ -2377,26 +2492,53 @@ class GasTracker:
     # -----------------------------
     # 可视化（抽帧）
     # -----------------------------
-    def plot_evolution(self, step=200):
+    def plot_evolution(self, step=200, max_dist=50.0, min_track_length=1):
+        self._ensure_output_root()
         if self.W is None or self.H is None:
-            print("[skip] plot_evolution: image_path is not set.")
+            print("[skip] plot_evolution: no image size is available from raw_frame_dir/image_path.")
             return
 
+        allowed_instance_ids = None
+        if int(min_track_length) > 1 and len(self.object_records) > 0:
+            aligned_instance_ids = self._build_export_instance_ids(
+                max_dist=max_dist,
+                id_mode="event",
+                use_display_id=False,
+            )
+            counts_by_id = Counter(int(instance_id) for instance_id in aligned_instance_ids)
+            allowed_instance_ids = {
+                int(instance_id)
+                for instance_id, count in counts_by_id.items()
+                if int(count) >= int(min_track_length)
+            }
+        elif len(self.object_records) > 0:
+            aligned_instance_ids = self._build_export_instance_ids(
+                max_dist=max_dist,
+                id_mode="event",
+                use_display_id=False,
+            )
+        else:
+            aligned_instance_ids = []
+
         fig, ax = plt.subplots(figsize=(8, 8))
-        scale = float(self.max_nm_per_px) if self.max_nm_per_px is not None else 1.0
-        ax.set_xlim(0, self.W * scale * 1.5)
-        ax.set_ylim(self.H * scale, 0)
-        ax.set_xlabel("x (nm)")
-        ax.set_ylabel("y (nm)")
+        ax.set_xlim(0, self.W)
+        ax.set_ylim(self.H, 0)
+        ax.set_xlabel("x (px)")
+        ax.set_ylabel("y (px)")
         ax.set_aspect("equal", adjustable="box")
 
         cmap = plt.cm.plasma
         norm = Normalize(vmin=0, vmax=len(self.json_files) - 1)
 
-        for row in self.contour_records:
+        for row_idx, row in enumerate(self.contour_records):
             frame_id = row[0]
             if frame_id % step != 0:
                 continue
+            if allowed_instance_ids is not None:
+                if row_idx >= len(aligned_instance_ids):
+                    continue
+                if int(aligned_instance_ids[row_idx]) not in allowed_instance_ids:
+                    continue
 
             pts = []
             # row format: [frame_id, frame_name, "(x_nm,y_nm)", ...]
@@ -2408,6 +2550,7 @@ class GasTracker:
                 pts.append([x, y])
 
             pts = np.array(pts)
+            pts = self._coords_nm_to_plot_px(pts, frame_name=row[1])
             pts = np.vstack([pts, pts[0]])
 
             ax.plot(
@@ -2441,76 +2584,50 @@ class GasTracker:
         plt.savefig(outname, dpi=300, bbox_inches="tight")
         print(f"Saved evolution plot: {outname}")
 
-    def plot_centroid_trajectories(self, max_dist=50.0):
+    def plot_centroid_trajectories(self, max_dist=50.0, min_track_length=1):
         """
         Build simple greedy tracks by linking centroids in consecutive frames
         when their distance is <= max_dist. Save plot to PNG.
-        NOTE: max_dist is in nm because centroids are stored in nm.
+        NOTE: max_dist is in the current exported distance unit.
         """
+        self._ensure_output_root()
         if self.W is None or self.H is None:
-            print("[skip] plot_centroid_trajectories: image_path is not set.")
+            print("[skip] plot_centroid_trajectories: no image size is available from raw_frame_dir/image_path.")
             return
 
         if len(self.centroid_records) == 0:
             print("No centroid records to plot.")
             return
 
-        from collections import defaultdict
-
-        # organize centroids by frame
-        by_frame = defaultdict(list)
-        for frame_id, frame_name, nm_per_px, cx_nm, cy_nm in self.centroid_records:
-            by_frame[int(frame_id)].append((frame_name, float(cx_nm), float(cy_nm)))
-
-        tracks = []  # each track: {'last_frame': int, 'points': [(frame,cx,cy), ...]}
-
-        for frame in sorted(by_frame.keys()):
-            pts = by_frame[frame]
-            assigned = [False] * len(pts)
-
-            # try to extend existing tracks from previous frame
-            for t in tracks:
-                if t['last_frame'] != frame - 1:
-                    continue
-                last_x, last_y = t['points'][-1][2], t['points'][-1][3]
-                best_idx = None
-                best_dist = float('inf')
-                for i, (frame_name, cx_nm, cy_nm) in enumerate(pts):
-                    if assigned[i]:
-                        continue
-                    d = np.hypot(cx_nm - last_x, cy_nm - last_y)
-                    if d < best_dist:
-                        best_dist = d
-                        best_idx = i
-
-                if best_idx is not None and best_dist <= max_dist:
-                    frame_name, cx_nm, cy_nm = pts[best_idx]
-                    t['points'].append((frame, frame_name, cx_nm, cy_nm))
-                    t['last_frame'] = frame
-                    assigned[best_idx] = True
-
-            # create new tracks for unassigned centroids
-            for i, (frame_name, cx_nm, cy_nm) in enumerate(pts):
-                if not assigned[i]:
-                    tracks.append({'last_frame': frame, 'points': [(frame, frame_name, cx_nm, cy_nm)]})
+        by_frame = self._object_detections_by_frame()
+        series_by_id, _events = self._build_event_id_series(by_frame, max_dist=max_dist)
+        series_by_id = {
+            int(instance_id): pts
+            for instance_id, pts in series_by_id.items()
+            if len(pts) >= int(min_track_length)
+        }
 
         # plotting
         fig, ax = plt.subplots(figsize=(8, 8))
-        scale = float(self.max_nm_per_px) if self.max_nm_per_px is not None else 1.0
-        ax.set_xlim(0, self.W * scale * 1.5)
-        ax.set_ylim(self.H * scale, 0)
-        ax.set_xlabel("x (nm)")
-        ax.set_ylabel("y (nm)")
+        ax.set_xlim(0, self.W)
+        ax.set_ylim(self.H, 0)
+        ax.set_xlabel("x (px)")
+        ax.set_ylabel("y (px)")
         ax.set_aspect("equal", adjustable="box")
 
         # color by frame (time axis) — use same colormap/norm as evolution
         cmap = plt.cm.plasma
         norm = Normalize(vmin=0, vmax=len(self.json_files) - 1)
 
-        for idx, t in enumerate(tracks):
-            
-            frames = np.array([p[0] for p in t['points']])
-            pts = np.array([[p[2], p[3]] for p in t['points']])
+        for instance_id, series in series_by_id.items():
+            frames = np.array([p[0] for p in series])
+            pts = np.array([[p[3], p[4]] for p in series], dtype=np.float64)
+            nm_scales = [p[2] for p in series]
+            frame_names = [p[1] for p in series]
+            pts = np.array([
+                self._coords_nm_to_plot_px(pt, frame_name=frame_name, nm_per_px=nm_per_px)
+                for pt, frame_name, nm_per_px in zip(pts, frame_names, nm_scales)
+            ], dtype=np.float64)
             if pts.shape[0] == 0:
                 continue
 
@@ -2551,37 +2668,50 @@ class GasTracker:
 # 主程序入口
 # ======================
 if __name__ == "__main__":
+    gas_category = "nanodroplet"
+    output_root = os.path.join("outputs", gas_category)
+    raw_frame_dir = "data_cus/gas-liquid-frame"
+    manual_scale_pixel_length =10   # e.g. 120.0 means the 20 nm scale bar spans 120 px
+    manual_nm_per_px = None            # e.g. 0.166667; overrides manual_scale_pixel_length if set alone
+    min_track_length_plot = 3          # filter short-lived detections in trajectory plots
+
     tracker = GasTracker(
-        json_dir=r"D:\code\nanojccode\data\TEM\zwl_42_label_512",
-        image_path=r"D:\code\nanojccode\data\TEM\zwl_42_label_512_voc\1 1 145kx 20251216_000000000000_SwinIR.png",
+        json_dir="outputs/gas-liquid-first-frame-sam3/mask_source",
+        raw_frame_dir=raw_frame_dir,
         #scale_csv=r"D:\code\nanojccode\data\nanoframes\scalebar_mauel.csv",
-        #output_root="./result/0510",
+        output_root=output_root,
         scale_value_nm=20.0,
+        manual_scale_pixel_length=manual_scale_pixel_length,
+        manual_nm_per_px=manual_nm_per_px,
         strict_scale_match=False,
-        gas_category="nanocluster",
+        gas_category=gas_category,
         #pin_category="pin"
     )
     tracker.process_all_frames()
     tracker.export_results()
-    # Output dir logic now inside class if passed None, or relative to output_root if passed string
-    tracker.annotate_images(output_dir="annotated_nanocluster", label_ids=True)
+    tracker.annotate_images(label_ids=True)
+    
     tracker.annotate_images_on_rawframe(
-        raw_frame_dir="D:\\code\\nanojccode\\data\\TEM\\swinir_real_sr_x2_resize512",   # 原始帧图像所在目录
-        output_dir="annotated_nanocluster_rawframe",
+        raw_frame_dir=raw_frame_dir,   # 原始帧图像所在目录
         label_ids=True,
         mask_alpha=120,
     )
     tracker.annotate_allcategories_on_rawframe(
-        raw_frame_dir="D:\\code\\nanojccode\\data\\TEM\\swinir_real_sr_x2_resize512",   # 原始帧图像所在目录
-        output_dir="annotated_allcat_rawframe",
+        raw_frame_dir=raw_frame_dir,   # 原始帧图像所在目录
         mask_alpha=120,
         show_centroid=False,
         label_ids=False
     )
-    tracker.plot_evolution(step=2)
-    tracker.plot_centroid_trajectories(max_dist=50)
-    tracker.plot_area_trajectories(max_dist=50, min_track_length=0, debug_stats=True)
+    tracker.plot_evolution(step=2, max_dist=50, min_track_length=min_track_length_plot)
+    tracker.plot_centroid_trajectories(max_dist=50, min_track_length=min_track_length_plot)
+    tracker.plot_area_trajectories(max_dist=50, min_track_length=min_track_length_plot, debug_stats=True)
     tracker.plot_frame_instance_count_and_total_area()
     tracker.plot_area_delta_vs_frame(per_frame=True, reducer="sum")
     # 30 fps => 1/30 s per frame; speed unit: nm/s
-    tracker.plot_velocity_trajectories(max_dist=50, min_track_length=0, frame_interval_s=1/30, bin_size_frames=1, debug_stats=True)
+    tracker.plot_velocity_trajectories(
+        max_dist=50,
+        min_track_length=min_track_length_plot,
+        frame_interval_s=1/30,
+        bin_size_frames=1,
+        debug_stats=True,
+    )
