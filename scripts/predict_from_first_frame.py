@@ -38,13 +38,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-root",
         type=Path,
-        default=Path("data_cus/zwl_resize512_878"),
+        default=Path("data_cus/zwl_raw_resize512_878"),
         help="Dataset root containing group_*/frame and group_*/mark folders.",
     )
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=Path("outputs/zwl_resize512_878-sam3"),
+        default=Path("outputs/zwl_raw_resize512_878-sam3"),
         help="Directory used to store predicted annotations.",
     )
     parser.add_argument(
