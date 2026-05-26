@@ -41,7 +41,10 @@ def _polygon_bbox(points: list[list[float]]) -> list[float]:
     return [x_min, y_min, x_max, y_max]
 
 
-def _mask_to_polygons(mask_bool: np.ndarray) -> list[list[list[float]]]:
+def _mask_to_polygons(
+    mask_bool: np.ndarray,
+    simplify_epsilon: float = 2.0,
+) -> list[list[list[float]]]:
     mask_u8 = (mask_bool.astype(np.uint8) * 255)
     contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -49,6 +52,10 @@ def _mask_to_polygons(mask_bool: np.ndarray) -> list[list[list[float]]]:
     for contour in contours:
         if contour.shape[0] < 3:
             continue
+        if simplify_epsilon > 0:
+            contour = cv2.approxPolyDP(contour, epsilon=float(simplify_epsilon), closed=True)
+            if contour.shape[0] < 3:
+                continue
         pts = contour.reshape(-1, 2).astype(float).tolist()
         if len(pts) >= 3:
             polygons.append(pts)
@@ -70,6 +77,7 @@ def _build_isat_payload(
     category_name: str,
     score_threshold: float,
     min_area: float,
+    polygon_simplify_epsilon: float,
     instance_ids: list[int] | None = None,
     instance_categories: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -96,7 +104,10 @@ def _build_isat_payload(
 
         instance_category = resolved_instance_categories[mask_idx]
 
-        polygons = _mask_to_polygons(mask_bool)
+        polygons = _mask_to_polygons(
+            mask_bool,
+            simplify_epsilon=float(polygon_simplify_epsilon),
+        )
         for poly in polygons:
             area = _polygon_area(poly)
             if area < min_area:
@@ -136,6 +147,7 @@ def save_inference_as_isat(
     category_name: str = "畴区",
     score_threshold: float = 0.5,
     min_area: float = 20.0,
+    polygon_simplify_epsilon: float = 2.0,
 ) -> Path:
     masks = (
         inference_state["masks"].squeeze(1).detach().cpu().numpy().astype(bool)
@@ -151,6 +163,7 @@ def save_inference_as_isat(
         category_name=category_name,
         score_threshold=float(score_threshold),
         min_area=float(min_area),
+        polygon_simplify_epsilon=float(polygon_simplify_epsilon),
         instance_ids=None,
         instance_categories=None,
     )
@@ -168,6 +181,7 @@ def save_masks_as_isat(
     scores: list[float] | None = None,
     score_threshold: float = 0.5,
     min_area: float = 20.0,
+    polygon_simplify_epsilon: float = 2.0,
     instance_ids: list[int] | None = None,
     instance_categories: list[str] | None = None,
 ) -> Path:
@@ -187,6 +201,7 @@ def save_masks_as_isat(
         category_name=category_name,
         score_threshold=float(score_threshold),
         min_area=float(min_area),
+        polygon_simplify_epsilon=float(polygon_simplify_epsilon),
         instance_ids=instance_ids,
         instance_categories=instance_categories,
     )
@@ -202,6 +217,7 @@ def convert_prediction_json_to_isat(
     category_name: str = "畴区",
     score_threshold: float = 0.5,
     min_area: float = 20.0,
+    polygon_simplify_epsilon: float = 2.0,
 ) -> Path:
     input_path = Path(input_json_path)
     data = _load_json(input_path)
@@ -234,6 +250,7 @@ def convert_prediction_json_to_isat(
         category_name=category_name,
         score_threshold=float(score_threshold),
         min_area=float(min_area),
+        polygon_simplify_epsilon=float(polygon_simplify_epsilon),
         instance_ids=None,
         instance_categories=None,
     )

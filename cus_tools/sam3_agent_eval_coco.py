@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import tempfile
 
 import pycocotools.mask as mask_utils
 
@@ -135,7 +136,34 @@ def normalized_cxcywh_to_xywh(box, image_width, image_height):
     return [float(x1), float(y1), float(max(0.0, x2 - x1)), float(max(0.0, y2 - y1))]
 
 
-def load_agent_prediction_as_coco(prediction_path, image_info, next_annotation_id):
+def _mask_to_flat_polygons(mask_bool, simplify_epsilon=2.0):
+    import cv2
+    import numpy as np
+
+    mask_u8 = np.asarray(mask_bool, dtype="uint8") * 255
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    polygons = []
+    for contour in contours:
+        if contour.shape[0] < 3:
+            continue
+        if simplify_epsilon and simplify_epsilon > 0:
+            contour = cv2.approxPolyDP(contour, epsilon=float(simplify_epsilon), closed=True)
+            if contour.shape[0] < 3:
+                continue
+        polygon = contour.reshape(-1, 2).astype(float).tolist()
+        if len(polygon) >= 3:
+            polygons.append([coord for point in polygon for coord in point])
+
+    return polygons
+
+
+def load_agent_prediction_as_coco(
+    prediction_path,
+    image_info,
+    next_annotation_id,
+    polygon_simplify_epsilon=2.0,
+):
     with Path(prediction_path).open("r", encoding="utf-8") as handle:
         prediction = json.load(handle)
 
@@ -158,20 +186,27 @@ def load_agent_prediction_as_coco(prediction_path, image_info, next_annotation_i
         if area <= 0:
             continue
 
+        decoded_mask = mask_utils.decode(rle_for_tools)
+        if getattr(decoded_mask, "ndim", 0) == 3:
+            decoded_mask = decoded_mask[..., 0]
+        polygons = _mask_to_flat_polygons(
+            decoded_mask,
+            simplify_epsilon=polygon_simplify_epsilon,
+        )
+        if not polygons:
+            continue
+
         if index < len(pred_boxes):
             bbox = normalized_cxcywh_to_xywh(pred_boxes[index], image_width, image_height)
         else:
-            bbox = [float(value) for value in mask_utils.toBbox(rle_for_tools).tolist()]
+            bbox = polygon_bbox(polygons)
 
         annotations.append(
             {
                 "id": next_annotation_id,
                 "image_id": image_info["id"],
                 "category_id": 1,
-                "segmentation": {
-                    "size": [image_height, image_width],
-                    "counts": counts if isinstance(counts, str) else counts.decode("utf-8"),
-                },
+                "segmentation": polygons,
                 "score": float(pred_scores[index]) if index < len(pred_scores) else 1.0,
                 "bbox": bbox,
                 "area": area,
@@ -186,7 +221,12 @@ def load_agent_prediction_as_coco(prediction_path, image_info, next_annotation_i
 def evaluate_coco_predictions(gt_path, predictions_path):
     predictions_path = Path(predictions_path)
     with predictions_path.open("r", encoding="utf-8") as handle:
-        predictions = json.load(handle)
+        predictions_payload = json.load(handle)
+
+    if isinstance(predictions_payload, dict):
+        predictions = predictions_payload.get("annotations", [])
+    else:
+        predictions = predictions_payload
 
     if not predictions:
         zero_metrics = {
@@ -213,4 +253,14 @@ def evaluate_coco_predictions(gt_path, predictions_path):
         tide=False,
         iou_type="segm",
     )
+
+    if isinstance(predictions_payload, dict):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", encoding="utf-8", delete=False) as handle:
+            json.dump(predictions, handle, indent=2, ensure_ascii=False)
+            normalized_predictions_path = Path(handle.name)
+        try:
+            return evaluator.evaluate(str(normalized_predictions_path))
+        finally:
+            normalized_predictions_path.unlink(missing_ok=True)
+
     return evaluator.evaluate(str(predictions_path))

@@ -73,6 +73,7 @@ def run_batch_text_prompt_inference(
     confidence_threshold=0.5,
     category_name="畴区",
     min_area=20.0,
+    polygon_simplify_epsilon=2.0,
 ):
     image_dir = Path(image_dir)
     output_dir = Path(output_dir)
@@ -137,6 +138,7 @@ def run_batch_text_prompt_inference(
                         category_name=category_name,
                         score_threshold=confidence_threshold,
                         min_area=min_area,
+                        polygon_simplify_epsilon=polygon_simplify_epsilon,
                     )
                 num_predictions = len(prediction_payload["pred_masks"])
             except Exception as exc:
